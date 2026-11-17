@@ -1,0 +1,870 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel Invaders</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #05060f;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<script>
+(() => {
+'use strict';
+
+/* =====================================================================
+   CONFIGURAÇÃO
+   ===================================================================== */
+const CFG = {
+  vidasIniciais: 3,
+  velJogador: 300,        // px/s
+  aceleracao: 14,         // quanto maior, mais "seco" o movimento
+  cooldownTiro: 0.17,     // segundos entre tiros
+  velProjetil: 760,       // px/s
+  invulnerabilidade: 1.6, // segundos após levar dano
+  chaveRecorde: 'pixelInvaders.recorde'
+};
+
+/* =====================================================================
+   SPRITES (pixel art desenhada em código)
+   '#' = pixel preenchido, '.' = vazio
+   ===================================================================== */
+function compilar(linhas) {
+  const cells = [];
+  linhas.forEach((linha, r) => {
+    for (let c = 0; c < linha.length; c++) if (linha[c] === '#') cells.push([c, r]);
+  });
+  return { w: linhas[0].length, h: linhas.length, cells };
+}
+
+const SPRITES = {
+  nave: compilar([
+    '.....#.....',
+    '....###....',
+    '....###....',
+    '...#####...',
+    '..#######..',
+    '.#########.',
+    '####.#.####',
+    '###.....###',
+    '##.......##'
+  ]),
+  caranguejo: [
+    compilar([
+      '..#.....#..',
+      '...#...#...',
+      '..#######..',
+      '.##.###.##.',
+      '###########',
+      '#.#######.#',
+      '#.#.....#.#',
+      '...##.##...'
+    ]),
+    compilar([
+      '..#.....#..',
+      '#..#...#..#',
+      '#.#######.#',
+      '###.###.###',
+      '###########',
+      '.#########.',
+      '..#.....#..',
+      '.#.......#.'
+    ])
+  ],
+  lula: [
+    compilar([
+      '...##...',
+      '..####..',
+      '.######.',
+      '##.##.##',
+      '########',
+      '..#..#..',
+      '.#.##.#.',
+      '#.#..#.#'
+    ]),
+    compilar([
+      '...##...',
+      '..####..',
+      '.######.',
+      '##.##.##',
+      '########',
+      '.#.##.#.',
+      '#......#',
+      '.#....#.'
+    ])
+  ],
+  polvo: [
+    compilar([
+      '....####....',
+      '.##########.',
+      '############',
+      '###..##..###',
+      '############',
+      '...##..##...',
+      '..##.##.##..',
+      '##........##'
+    ]),
+    compilar([
+      '....####....',
+      '.##########.',
+      '############',
+      '###..##..###',
+      '############',
+      '..###..###..',
+      '.##..##..##.',
+      '..##....##..'
+    ])
+  ],
+  // O clássico "splat" de explosão dos invaders
+  explosao: compilar([
+    '.#..#...#..#.',
+    '..#..#.#..#..',
+    '...#.....#...',
+    '##.........##',
+    '...#.....#...',
+    '..#..#.#..#..',
+    '.#..#...#..#.'
+  ])
+};
+
+const TIPOS = [
+  { nome: 'caranguejo', cor: '#5dff7a', pontos: 10, vel: 1.0,  peso: 5 },
+  { nome: 'lula',       cor: '#ff5ad8', pontos: 20, vel: 1.3,  peso: 3 },
+  { nome: 'polvo',      cor: '#ffd23f', pontos: 30, vel: 0.8,  peso: 2 }
+];
+
+/* =====================================================================
+   ESTADO GLOBAL
+   ===================================================================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W = 0, H = 0, DPR = 1, PX = 4;          // tamanho lógico e escala do pixel
+const mouse = { x: 0, y: 0, pressionado: false, moveu: false };
+const teclas = {};
+let estado = 'menu';                          // 'menu' | 'jogando' | 'pausado' | 'fim'
+
+let jogador, inimigos, projeteis, particulas, flashes, estrelas;
+let pontos = 0, recorde = 0, recordeAnterior = 0, novoRecorde = false;
+let tempoJogo = 0, tempoSpawn = 0, tempoAnim = 0;
+let tremor = 0, flashDano = 0, bloqueioFim = 0;
+let tiroPendente = false;
+let nivelAtual = 1, bannerNivel = 0;
+
+/* =====================================================================
+   UTILITÁRIOS
+   ===================================================================== */
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+const fmt = n => String(n).padStart(6, '0');
+
+// Distância de um ponto a um segmento (usado para colisão "varrida" dos tiros)
+function distSegPonto(x1, y1, x2, y2, px, py) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const l2 = dx * dx + dy * dy;
+  let t = l2 ? ((px - x1) * dx + (py - y1) * dy) / l2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+function carregarRecorde() {
+  try { return parseInt(localStorage.getItem(CFG.chaveRecorde), 10) || 0; }
+  catch (e) { return 0; }
+}
+function salvarRecorde(v) {
+  try { localStorage.setItem(CFG.chaveRecorde, String(v)); } catch (e) { /* ignora */ }
+}
+
+/* Desenha um sprite centralizado em (cx, cy). Todos os pixels vão em um único path. */
+function desenharSprite(spr, cx, cy, escala, cor, rot = 0) {
+  ctx.save();
+  ctx.translate(Math.round(cx), Math.round(cy));
+  if (rot) ctx.rotate(rot);
+  const ox = -spr.w * escala / 2, oy = -spr.h * escala / 2;
+  ctx.fillStyle = cor;
+  ctx.beginPath();
+  for (const [c, r] of spr.cells) ctx.rect(ox + c * escala, oy + r * escala, escala, escala);
+  ctx.fill();
+  ctx.restore();
+}
+
+/* =====================================================================
+   ÁUDIO (Web Audio API, sons gerados por código)
+   ===================================================================== */
+let audioCtx = null, mudo = false, bufferRuidoCache = null;
+
+function iniciarAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch (e) { audioCtx = null; }
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function tom(f0, f1, dur, tipo = 'square', vol = 0.05) {
+  if (!audioCtx || mudo) return;
+  const t = audioCtx.currentTime;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = tipo;
+  o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(audioCtx.destination);
+  o.start(t);
+  o.stop(t + dur);
+}
+
+function bufferRuido() {
+  if (!bufferRuidoCache) {
+    const len = audioCtx.sampleRate;
+    bufferRuidoCache = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+    const d = bufferRuidoCache.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  }
+  return bufferRuidoCache;
+}
+
+function ruido(dur, vol = 0.16, freq = 2000) {
+  if (!audioCtx || mudo) return;
+  const t = audioCtx.currentTime;
+  const src = audioCtx.createBufferSource();
+  src.buffer = bufferRuido();
+  const filtro = audioCtx.createBiquadFilter();
+  filtro.type = 'lowpass';
+  filtro.frequency.setValueAtTime(freq, t);
+  filtro.frequency.exponentialRampToValueAtTime(120, t + dur);
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(filtro).connect(g).connect(audioCtx.destination);
+  src.start(t);
+  src.stop(t + dur);
+}
+
+const somTiro      = () => tom(900, 200, 0.11, 'square', 0.04);
+const somExplosao  = () => { ruido(0.32, 0.18, 2400); tom(180, 40, 0.25, 'sawtooth', 0.05); };
+const somDano      = () => { ruido(0.6, 0.28, 1600); tom(300, 50, 0.5, 'sawtooth', 0.08); };
+const somFim       = () => { ruido(1.0, 0.3, 1400); tom(220, 30, 0.9, 'sawtooth', 0.1); };
+const somNivel     = () => { tom(520, 520, 0.08, 'square', 0.04); setTimeout(() => tom(780, 780, 0.12, 'square', 0.04), 90); };
+
+/* =====================================================================
+   FUNDO (estrelas)
+   ===================================================================== */
+function gerarEstrelas() {
+  const n = Math.round((W * H) / 9000);
+  estrelas = [];
+  for (let i = 0; i < n; i++) {
+    estrelas.push({
+      x: Math.random() * W, y: Math.random() * H,
+      tam: Math.random() < 0.2 ? 2 : 1,
+      fase: rand(0, 6.28), vel: rand(4, 18)
+    });
+  }
+}
+
+function atualizarEstrelas(dt) {
+  for (const s of estrelas) {
+    s.y += s.vel * dt;
+    if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+  }
+}
+
+function desenharEstrelas() {
+  for (const s of estrelas) {
+    const a = 0.35 + 0.35 * Math.sin(tempoAnim * 2 + s.fase);
+    ctx.fillStyle = `rgba(190, 210, 255, ${a})`;
+    ctx.fillRect(Math.round(s.x), Math.round(s.y), s.tam * 2, s.tam * 2);
+  }
+}
+
+/* =====================================================================
+   JOGADOR
+   ===================================================================== */
+function criarJogador() {
+  return {
+    x: W / 2, y: H / 2, vx: 0, vy: 0,
+    ang: -Math.PI / 2,
+    vidas: CFG.vidasIniciais,
+    invuln: 0, cooldown: 0, raio: 12
+  };
+}
+
+function atualizarJogador(dt) {
+  const j = jogador;
+
+  // Direção desejada (WASD, e setas como bônus). Diagonais são normalizadas.
+  let ix = 0, iy = 0;
+  if (teclas['KeyA'] || teclas['ArrowLeft'])  ix -= 1;
+  if (teclas['KeyD'] || teclas['ArrowRight']) ix += 1;
+  if (teclas['KeyW'] || teclas['ArrowUp'])    iy -= 1;
+  if (teclas['KeyS'] || teclas['ArrowDown'])  iy += 1;
+  if (ix && iy) { ix *= Math.SQRT1_2; iy *= Math.SQRT1_2; }
+
+  // Suaviza a velocidade em direção à desejada
+  const k = Math.min(1, CFG.aceleracao * dt);
+  j.vx += (ix * CFG.velJogador - j.vx) * k;
+  j.vy += (iy * CFG.velJogador - j.vy) * k;
+  j.x += j.vx * dt;
+  j.y += j.vy * dt;
+
+  // Mantém dentro da tela
+  const m = 20;
+  j.x = Math.max(m, Math.min(W - m, j.x));
+  j.y = Math.max(m, Math.min(H - m, j.y));
+
+  // Mira no cursor
+  j.ang = Math.atan2(mouse.y - j.y, mouse.x - j.x);
+
+  // Tiro (segurar o botão dispara continuamente; o clique rápido fica "guardado")
+  j.cooldown -= dt;
+  if (j.invuln > 0) j.invuln -= dt;
+  if ((mouse.pressionado || tiroPendente) && j.cooldown <= 0) {
+    atirar();
+    j.cooldown = CFG.cooldownTiro;
+    tiroPendente = false;
+  }
+}
+
+function desenharJogador() {
+  const j = jogador;
+  if (j.invuln > 0 && Math.floor(j.invuln * 12) % 2 === 0) return; // pisca ao levar dano
+  const rot = j.ang + Math.PI / 2;
+  const spr = SPRITES.nave;
+  const escala = Math.max(3, PX - 1);
+
+  // Chama do motor (atrás da nave)
+  ctx.save();
+  ctx.translate(Math.round(j.x), Math.round(j.y));
+  ctx.rotate(rot);
+  const fy = spr.h * escala / 2;
+  const comp = (Math.sin(tempoAnim * 40) > 0 ? 3 : 2) * escala;
+  ctx.fillStyle = '#ff9a2e';
+  ctx.fillRect(-escala * 1.5, fy, escala, comp);
+  ctx.fillRect(escala * 0.5, fy, escala, comp);
+  ctx.restore();
+
+  desenharSprite(spr, j.x, j.y, escala, '#5df2ff', rot);
+}
+
+/* =====================================================================
+   PROJÉTEIS
+   ===================================================================== */
+function atirar() {
+  const j = jogador;
+  const dx = Math.cos(j.ang), dy = Math.sin(j.ang);
+  const x = j.x + dx * 22, y = j.y + dy * 22;
+  projeteis.push({
+    x, y, ox: x, oy: y,
+    vx: dx * CFG.velProjetil, vy: dy * CFG.velProjetil,
+    ang: j.ang, vida: 1.4, morto: false
+  });
+  somTiro();
+}
+
+function atualizarProjeteis(dt) {
+  for (const p of projeteis) {
+    p.ox = p.x; p.oy = p.y;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vida -= dt;
+    if (p.vida <= 0 || p.x < -40 || p.x > W + 40 || p.y < -40 || p.y > H + 40) p.morto = true;
+  }
+}
+
+function desenharProjeteis() {
+  for (const p of projeteis) {
+    ctx.save();
+    ctx.translate(Math.round(p.x), Math.round(p.y));
+    ctx.rotate(p.ang);
+    ctx.fillStyle = 'rgba(255, 245, 138, 0.35)';
+    ctx.fillRect(-PX * 6, -PX / 2, PX * 4, PX);      // rastro
+    ctx.fillStyle = '#fff58a';
+    ctx.fillRect(-PX * 2, -PX / 2, PX * 4, PX);      // corpo
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, -PX / 2, PX * 2, PX);            // núcleo
+    ctx.restore();
+  }
+}
+
+/* =====================================================================
+   INIMIGOS
+   ===================================================================== */
+function sortearTipo() {
+  const total = TIPOS.reduce((s, t) => s + t.peso, 0);
+  let r = Math.random() * total;
+  for (const t of TIPOS) { r -= t.peso; if (r <= 0) return t; }
+  return TIPOS[0];
+}
+
+const velBase = () => Math.min(70 + tempoJogo * 1.8, 210);
+const maxInimigos = () => Math.min(70, 12 + Math.floor(tempoJogo / 6));
+
+function spawnInimigo() {
+  const tipo = sortearTipo();
+  const spr = SPRITES[tipo.nome][0];
+  const raio = Math.max(spr.w, spr.h) * PX * 0.4;
+  const m = raio + 24;
+  let x, y;
+  switch ((Math.random() * 4) | 0) {          // aparece em uma das 4 bordas
+    case 0: x = rand(0, W); y = -m; break;
+    case 1: x = W + m;      y = rand(0, H); break;
+    case 2: x = rand(0, W); y = H + m; break;
+    default: x = -m;        y = rand(0, H);
+  }
+  inimigos.push({
+    x, y, tipo, raio,
+    vel: velBase() * tipo.vel * rand(0.85, 1.15),
+    fase: rand(0, 6.28), anim: rand(0, 1), morto: false
+  });
+}
+
+function atualizarInimigos(dt) {
+  const j = jogador;
+  for (const e of inimigos) {
+    // Persegue o jogador com um leve zigue-zague
+    const dx = j.x - e.x, dy = j.y - e.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const nx = dx / d, ny = dy / d;
+    const zig = Math.sin(e.fase + tempoJogo * 3) * 0.35;
+    e.x += (nx - ny * zig) * e.vel * dt;
+    e.y += (ny + nx * zig) * e.vel * dt;
+  }
+
+  // Separação simples para os inimigos não se empilharem
+  for (let i = 0; i < inimigos.length; i++) {
+    for (let k = i + 1; k < inimigos.length; k++) {
+      const a = inimigos[i], b = inimigos[k];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const min = (a.raio + b.raio) * 0.8;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < min * min && d2 > 0.01) {
+        const d = Math.sqrt(d2);
+        const push = (min - d) / 2;
+        const nx = dx / d, ny = dy / d;
+        a.x -= nx * push; a.y -= ny * push;
+        b.x += nx * push; b.y += ny * push;
+      }
+    }
+  }
+}
+
+function desenharInimigos() {
+  for (const e of inimigos) {
+    const frames = SPRITES[e.tipo.nome];
+    const frame = Math.floor(tempoAnim * 2 + e.anim * 2) % 2;
+    desenharSprite(frames[frame], e.x, e.y, PX, e.tipo.cor);
+  }
+}
+
+function desenharInimigosEstaticos() {
+  // Usado em game over / pausa: mantém o frame sem animar
+  for (const e of inimigos) desenharSprite(SPRITES[e.tipo.nome][0], e.x, e.y, PX, e.tipo.cor);
+}
+
+/* =====================================================================
+   PARTÍCULAS E EXPLOSÃO (estilo Space Invaders)
+   ===================================================================== */
+function explodir(x, y, cor, qtd = 22, escala = 1) {
+  // Flash: o "splat" clássico, branco e depois na cor do inimigo
+  flashes.push({ x, y, t: 0, dur: 0.2, cor, esc: escala });
+
+  // Pixels quadrados que se espalham
+  const cores = [cor, cor, '#ffffff', '#ffe66d'];
+  for (let i = 0; i < qtd; i++) {
+    const a = rand(0, Math.PI * 2);
+    const v = rand(70, 300) * escala;
+    const vida = rand(0.35, 0.85);
+    particulas.push({
+      x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v,
+      vida, max: vida,
+      tam: Math.round(PX * (Math.random() < 0.35 ? 2 : 1)),
+      cor: pick(cores)
+    });
+  }
+}
+
+function atualizarParticulas(dt) {
+  const atrito = Math.pow(0.08, dt);
+  for (const p of particulas) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= atrito;
+    p.vy *= atrito;
+    p.vida -= dt;
+  }
+  particulas = particulas.filter(p => p.vida > 0);
+
+  for (const f of flashes) f.t += dt;
+  flashes = flashes.filter(f => f.t < f.dur);
+}
+
+function desenharParticulas() {
+  for (const p of particulas) {
+    const a = Math.max(0, p.vida / p.max);
+    const t = Math.max(1, Math.round(p.tam * (0.4 + 0.6 * a)));
+    ctx.globalAlpha = a;
+    ctx.fillStyle = p.cor;
+    ctx.fillRect(Math.round(p.x - t / 2), Math.round(p.y - t / 2), t, t);
+  }
+  ctx.globalAlpha = 1;
+
+  for (const f of flashes) {
+    const k = f.t / f.dur;
+    ctx.globalAlpha = 1 - k * 0.6;
+    desenharSprite(SPRITES.explosao, f.x, f.y, PX * (1.1 + k * 0.5) * f.esc, k < 0.5 ? '#ffffff' : f.cor);
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* =====================================================================
+   COLISÕES
+   ===================================================================== */
+function colisoes() {
+  // Tiros x inimigos (colisão varrida: o tiro nunca "atravessa" um inimigo)
+  for (const p of projeteis) {
+    if (p.morto) continue;
+    for (const e of inimigos) {
+      if (e.morto) continue;
+      if (distSegPonto(p.ox, p.oy, p.x, p.y, e.x, e.y) < e.raio + 4) {
+        p.morto = true;
+        e.morto = true;
+        matarInimigo(e);
+        break;
+      }
+    }
+  }
+
+  // Inimigos x jogador
+  if (jogador.invuln <= 0) {
+    for (const e of inimigos) {
+      if (e.morto) continue;
+      if (Math.hypot(e.x - jogador.x, e.y - jogador.y) < e.raio + jogador.raio) {
+        e.morto = true;
+        explodir(e.x, e.y, e.tipo.cor, 22, 1);
+        danoJogador();
+        break;
+      }
+    }
+  }
+
+  projeteis = projeteis.filter(p => !p.morto);
+  inimigos = inimigos.filter(e => !e.morto);
+}
+
+function matarInimigo(e) {
+  pontos += e.tipo.pontos;
+  if (pontos > recorde) recorde = pontos;
+  explodir(e.x, e.y, e.tipo.cor, 22, 1);
+  tremor = Math.max(tremor, 5);
+  somExplosao();
+}
+
+function danoJogador() {
+  jogador.vidas--;
+  jogador.invuln = CFG.invulnerabilidade;
+  tremor = Math.max(tremor, 16);
+  flashDano = 0.35;
+  if (jogador.vidas <= 0) fimDeJogo();
+  else somDano();
+}
+
+/* =====================================================================
+   FLUXO DO JOGO
+   ===================================================================== */
+function resetar() {
+  jogador = criarJogador();
+  inimigos = []; projeteis = []; particulas = []; flashes = [];
+  pontos = 0; novoRecorde = false;
+  tempoJogo = 0; tempoSpawn = 1.0;
+  tremor = 0; flashDano = 0; tiroPendente = false;
+  nivelAtual = 1; bannerNivel = 0;
+  recordeAnterior = recorde;
+}
+
+function iniciar() {
+  iniciarAudio();
+  resetar();
+  estado = 'jogando';
+  canvas.style.cursor = 'none';
+}
+
+function fimDeJogo() {
+  estado = 'fim';
+  bloqueioFim = 0.9;
+  mouse.pressionado = false;
+  tiroPendente = false;
+  novoRecorde = pontos > recordeAnterior && pontos > 0;
+  if (novoRecorde) salvarRecorde(recorde);
+  explodir(jogador.x, jogador.y, '#5df2ff', 60, 2.2);
+  tremor = 26;
+  somFim();
+  canvas.style.cursor = 'default';
+}
+
+function alternarPausa() {
+  if (estado === 'jogando') {
+    estado = 'pausado';
+    mouse.pressionado = false;
+    canvas.style.cursor = 'default';
+  } else if (estado === 'pausado') {
+    estado = 'jogando';
+    canvas.style.cursor = 'none';
+  }
+}
+
+function atualizarJogo(dt) {
+  tempoJogo += dt;
+
+  // Nível sobe a cada 20 s
+  const nivel = 1 + Math.floor(tempoJogo / 20);
+  if (nivel > nivelAtual) { nivelAtual = nivel; bannerNivel = 1.6; somNivel(); }
+  if (bannerNivel > 0) bannerNivel -= dt;
+
+  // Spawn: mais frequente e em levas maiores com o tempo
+  tempoSpawn -= dt;
+  if (tempoSpawn <= 0) {
+    const qtd = 1 + (Math.random() < Math.min(0.6, tempoJogo / 120) ? 1 : 0);
+    for (let i = 0; i < qtd; i++) if (inimigos.length < maxInimigos()) spawnInimigo();
+    tempoSpawn = Math.max(0.28, 1.3 - tempoJogo * 0.011);
+  }
+
+  atualizarJogador(dt);
+  atualizarProjeteis(dt);
+  atualizarInimigos(dt);
+  colisoes();
+}
+
+function atualizar(dt) {
+  tempoAnim += dt;
+  atualizarEstrelas(dt);
+
+  if (estado === 'jogando') atualizarJogo(dt);
+  if (estado === 'jogando' || estado === 'fim') atualizarParticulas(dt);
+  if (estado === 'fim' && bloqueioFim > 0) bloqueioFim -= dt;
+
+  // Decaimento do tremor e do flash de dano
+  if (tremor > 0) { tremor *= Math.pow(0.002, dt); if (tremor < 0.3) tremor = 0; }
+  if (flashDano > 0) flashDano -= dt;
+}
+
+/* =====================================================================
+   INTERFACE (HUD E TELAS)
+   ===================================================================== */
+function texto(txt, x, y, tam, cor, alinhar = 'center') {
+  ctx.font = `bold ${tam}px "Courier New", monospace`;
+  ctx.textAlign = alinhar;
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = cor;
+  ctx.fillText(txt, x, y);
+}
+
+function desenharHUD() {
+  const f = 14 + PX * 2;
+  texto('PONTOS ' + fmt(pontos), 16, 26, f, '#ffffff', 'left');
+  texto('NÍVEL ' + nivelAtual, 16, 26 + f + 6, f - 4, '#8fa0ff', 'left');
+  texto('RECORDE ' + fmt(recorde), W / 2, 26, f, '#ffd23f', 'center');
+  for (let i = 0; i < jogador.vidas; i++) {
+    desenharSprite(SPRITES.nave, W - 28 - i * 34, 28, 2, '#5df2ff');
+  }
+  if (bannerNivel > 0 && estado === 'jogando') {
+    ctx.globalAlpha = Math.min(1, bannerNivel);
+    texto('NÍVEL ' + nivelAtual, W / 2, H * 0.22, 34 + PX * 4, '#ffffff');
+    ctx.globalAlpha = 1;
+  }
+}
+
+function desenharMira() {
+  const { x, y } = mouse;
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  const g = 6, s = PX * 2;
+  ctx.fillRect(Math.round(x - g - s), Math.round(y - 1), s, 2);
+  ctx.fillRect(Math.round(x + g),     Math.round(y - 1), s, 2);
+  ctx.fillRect(Math.round(x - 1), Math.round(y - g - s), 2, s);
+  ctx.fillRect(Math.round(x - 1), Math.round(y + g),     2, s);
+}
+
+function desenharMenu() {
+  // Fileira de invaders animados
+  const frame = Math.floor(tempoAnim * 2) % 2;
+  const esc = PX + 1;
+  TIPOS.forEach((t, i) => {
+    desenharSprite(SPRITES[t.nome][frame], W / 2 + (i - 1) * PX * 20, H * 0.24, esc, t.cor);
+  });
+
+  const t = Math.min(W / 14, 76);
+  texto('PIXEL INVADERS', W / 2 + 4, H * 0.37 + 4, t, '#1c7a4a');
+  texto('PIXEL INVADERS', W / 2, H * 0.37, t, '#5dff7a');
+
+  const f = Math.max(14, Math.min(W / 40, 22));
+  const y0 = H * 0.52;
+  texto('W A S D  ·  mover', W / 2, y0, f, '#cfd6ff');
+  texto('MOUSE  ·  mirar', W / 2, y0 + f * 1.9, f, '#cfd6ff');
+  texto('CLIQUE  ·  atirar', W / 2, y0 + f * 3.8, f, '#cfd6ff');
+  texto('P pausar   M som', W / 2, y0 + f * 5.7, f - 3, '#7b86b8');
+
+  if (Math.floor(tempoAnim * 2) % 2 === 0) {
+    texto('CLIQUE PARA COMEÇAR', W / 2, y0 + f * 8.4, f + 4, '#ffffff');
+  }
+  if (recorde > 0) texto('RECORDE ' + fmt(recorde), W / 2, H * 0.94, f, '#ffd23f');
+}
+
+function escurecer(a) {
+  ctx.fillStyle = `rgba(0, 0, 0, ${a})`;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function desenharPausa() {
+  escurecer(0.55);
+  texto('PAUSADO', W / 2, H * 0.45, 40 + PX * 6, '#ffffff');
+  texto('Clique ou pressione P para continuar', W / 2, H * 0.45 + 56, 18, '#cfd6ff');
+}
+
+function desenharFim() {
+  escurecer(0.55);
+  const t = Math.min(W / 10, 80);
+  texto('GAME OVER', W / 2, H * 0.33, t, '#ff4d5e');
+  texto('PONTOS  ' + fmt(pontos), W / 2, H * 0.33 + t * 1.2, 26, '#ffffff');
+  if (novoRecorde && Math.floor(tempoAnim * 3) % 2 === 0) {
+    texto('NOVO RECORDE!', W / 2, H * 0.33 + t * 1.2 + 42, 26, '#ffd23f');
+  } else if (!novoRecorde) {
+    texto('RECORDE  ' + fmt(recorde), W / 2, H * 0.33 + t * 1.2 + 42, 22, '#ffd23f');
+  }
+  if (bloqueioFim <= 0 && Math.floor(tempoAnim * 2) % 2 === 0) {
+    texto('Clique ou pressione R para reiniciar', W / 2, H * 0.72, 20, '#cfd6ff');
+  }
+}
+
+/* =====================================================================
+   DESENHO PRINCIPAL
+   ===================================================================== */
+function desenhar() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = '#05060f';
+  ctx.fillRect(0, 0, W, H);
+  desenharEstrelas();
+
+  ctx.save();
+  if (tremor > 0) ctx.translate(rand(-tremor, tremor) * 0.5, rand(-tremor, tremor) * 0.5);
+
+  if (estado !== 'menu') {
+    if (estado === 'jogando') desenharInimigos(); else desenharInimigosEstaticos();
+    desenharProjeteis();
+    if (jogador.vidas > 0) desenharJogador();
+    desenharParticulas();
+  }
+  ctx.restore();
+
+  if (flashDano > 0) {
+    ctx.fillStyle = `rgba(255, 40, 60, ${Math.min(0.35, flashDano)})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (estado === 'menu') desenharMenu();
+  else desenharHUD();
+
+  if (estado === 'jogando') desenharMira();
+  if (estado === 'pausado') desenharPausa();
+  if (estado === 'fim') desenharFim();
+}
+
+/* =====================================================================
+   LOOP PRINCIPAL (independente da taxa de quadros via delta time)
+   ===================================================================== */
+let ultimo = 0;
+function loop(agora) {
+  const dt = Math.min(0.05, (agora - ultimo) / 1000 || 0);
+  ultimo = agora;
+  atualizar(dt);
+  desenhar();
+  requestAnimationFrame(loop);
+}
+
+/* =====================================================================
+   ENTRADA (teclado e mouse) E REDIMENSIONAMENTO
+   ===================================================================== */
+function redimensionar() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  PX = Math.min(W, H) < 600 ? 3 : 4;
+  if (!mouse.moveu) { mouse.x = W / 2; mouse.y = H * 0.3; }
+  gerarEstrelas();
+  if (jogador) {
+    jogador.x = Math.max(20, Math.min(W - 20, jogador.x));
+    jogador.y = Math.max(20, Math.min(H - 20, jogador.y));
+  }
+}
+
+window.addEventListener('resize', redimensionar);
+
+window.addEventListener('keydown', e => {
+  teclas[e.code] = true;
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  if (e.repeat) return;
+
+  if (e.code === 'KeyM') { mudo = !mudo; return; }
+  if (e.code === 'KeyP' || e.code === 'Escape') { alternarPausa(); return; }
+  if (estado === 'menu' && (e.code === 'Enter' || e.code === 'Space')) iniciar();
+  else if (estado === 'fim' && bloqueioFim <= 0 && (e.code === 'KeyR' || e.code === 'Enter')) iniciar();
+});
+
+window.addEventListener('keyup', e => { teclas[e.code] = false; });
+
+canvas.addEventListener('mousemove', e => {
+  mouse.x = e.clientX; mouse.y = e.clientY; mouse.moveu = true;
+});
+
+canvas.addEventListener('mousedown', e => {
+  mouse.x = e.clientX; mouse.y = e.clientY; mouse.moveu = true;
+  if (e.button !== 0) return;
+  iniciarAudio();
+  if (estado === 'menu') { iniciar(); return; }
+  if (estado === 'fim') { if (bloqueioFim <= 0) iniciar(); return; }
+  if (estado === 'pausado') { alternarPausa(); return; }
+  mouse.pressionado = true;
+  tiroPendente = true;
+});
+
+window.addEventListener('mouseup', e => { if (e.button === 0) mouse.pressionado = false; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// Pausa automática ao perder o foco e solta todas as teclas
+window.addEventListener('blur', () => {
+  for (const k in teclas) teclas[k] = false;
+  mouse.pressionado = false;
+  if (estado === 'jogando') alternarPausa();
+});
+
+/* =====================================================================
+   INÍCIO
+   ===================================================================== */
+recorde = carregarRecorde();
+redimensionar();
+resetar();
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
